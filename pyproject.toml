@@ -67,6 +67,7 @@ dependencies = [
     "llama-cpp-python>=0.3.16",
     "requests",
     "numpy",
+    "scipy",
     "soundfile",
     "PyYAML",
     "gradio>=5.49.1",
@@ -91,6 +92,12 @@ gpu = [
     "triton; sys_platform == 'linux'",
     "transformers; sys_platform == 'darwin'",
     "accelerate; sys_platform == 'darwin'",
+    "omnivoice",  # OmniVoice Vietnamese TTS backend
+]
+omnivoice = [
+    "omnivoice",
+    "torch",
+    "torchaudio",
 ]
 
 [dependency-groups]
@@ -111,6 +118,12 @@ gpu = [
     "transformers; sys_platform == 'darwin'",
     "accelerate; sys_platform == 'darwin'",
     "trafilatura>=2.0.0",
+    "omnivoice",  # OmniVoice Vietnamese TTS backend
+]
+omnivoice = [
+    "omnivoice",
+    "torch",
+    "torchaudio",
 ]
 
 [tool.pytest.ini_options]

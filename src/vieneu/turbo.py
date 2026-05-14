@@ -180,11 +180,13 @@ class TurboVieNeuTTS(BaseVieneuTTS):
         if embedding is None:
             embedding = np.zeros((1, 128), dtype=np.float32)
             
+        input_names = {item.name for item in self.decoder_sess.get_inputs()}
         inputs = {
             "content_ids": tokens,
-            "voice_id": v_id,
-            "evoice_embedding": embedding
+            "voice_embedding": embedding
         }
+        if "voice_id" in input_names:
+            inputs["voice_id"] = v_id
         audio = self.decoder_sess.run(None, inputs)[0]
         # Ensure 1D output for watermarking (Samples,)
         if audio.ndim == 3:

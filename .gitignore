@@ -6,12 +6,17 @@ dist/
 wheels/
 *.egg-info
 .pytest_cache/
+*.log
+*.tmp
 
 # Virtual environments
 .venv
 .xpu_venv
 outputs/
 .env
+.gradio/
+tmp/
+temp/
 
 # Finetune Data & Checkpoints
 finetune/dataset/
