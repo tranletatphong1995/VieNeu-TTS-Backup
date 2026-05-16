@@ -23,6 +23,7 @@ if _LOCAL_SRC.exists():
         sys.path.insert(0, _local_src_str)
 
 from vieneu_utils.srt_audio import format_timecode, plan_subtitle_segments, read_srt
+from vieneu.base import coerce_ref_audio_path
 
 # Avoid Windows console UnicodeEncodeError when printing emoji/status logs.
 for _stream in (sys.stdout, sys.stderr):
@@ -60,16 +61,41 @@ ENGINE_DESCRIPTIONS = {
 
 
 # ── Khởi tạo VieNeu-TTS (lazy, thread-safe, chỉ load 1 lần) ──────────────────────────
-def get_vieneu_tts():
+def _is_turbo_engine(tts) -> bool:
+    return type(tts).__name__ == "TurboVieNeuTTS"
+
+
+def get_vieneu_tts(require_voice_cloning: bool = False):
     global _tts_vieneu
-    if _tts_vieneu is not None:          # Fast path — không cần lock
+    if _tts_vieneu is not None and not (require_voice_cloning and _is_turbo_engine(_tts_vieneu)):
         return _tts_vieneu
     with _lock_vieneu:
-        if _tts_vieneu is not None:      # Double-checked locking
+        if _tts_vieneu is not None and not (require_voice_cloning and _is_turbo_engine(_tts_vieneu)):
             return _tts_vieneu
         from vieneu import Vieneu
 
         has_cuda = torch is not None and torch.cuda.is_available()
+        if require_voice_cloning:
+            device = "cuda" if has_cuda else "cpu"
+            print(f"Loading VieNeu-TTS Standard mode for voice cloning on {device}...")
+            try:
+                kwargs = {
+                    "mode": "standard",
+                    "backbone_device": device,
+                    "codec_device": device,
+                }
+                if has_cuda:
+                    kwargs["backbone_repo"] = "pnnbao-ump/VieNeu-TTS"
+                _tts_vieneu = Vieneu(**kwargs)
+                print("VieNeu-TTS Standard voice cloning engine loaded!")
+                return _tts_vieneu
+            except Exception as e:
+                raise RuntimeError(
+                    "VieNeu-TTS voice cloning requires the Standard/Fast backend. "
+                    "Turbo CPU does not support reference-audio cloning. "
+                    f"Could not load Standard backend: {e}"
+                ) from e
+
         if has_cuda:
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             gpu_name = torch.cuda.get_device_name(0)
@@ -139,11 +165,11 @@ def get_omnivoice_tts():
     return _tts_omnivoice
 
 
-def get_tts(engine: str = "vieneu"):
+def get_tts(engine: str = "vieneu", require_voice_cloning: bool = False):
     """Trả về TTS engine tương ứng với lựa chọn của user."""
     if engine == "omnivoice":
         return get_omnivoice_tts()
-    return get_vieneu_tts()
+    return get_vieneu_tts(require_voice_cloning=require_voice_cloning)
 
 
 # ── Chia văn bản thành chunks ≤ max_chars ký tự ─────────────────────────────
@@ -276,6 +302,19 @@ def synthesize(
     if not text or not text.strip():
         return None, "⚠️ Vui lòng nhập văn bản cần đọc."
 
+    try:
+        ref_audio_path = coerce_ref_audio_path(ref_audio_path)
+    except Exception as e:
+        return None, f"❌ Không thể đọc audio tham chiếu: {e}"
+
+    use_cloning = bool(ref_audio_path and ref_text and ref_text.strip())
+
+    if ref_audio_path and not (ref_text and ref_text.strip()):
+        return None, (
+            "❌ Cần transcript của audio tham chiếu để clone giọng.\n"
+            "Vui lòng điền đúng nội dung nói trong file audio tham chiếu."
+        )
+
     # Validate OmniVoice requirements
     if engine == "omnivoice":
         if not ref_audio_path:
@@ -291,7 +330,7 @@ def synthesize(
 
     # Load engine — bắt lỗi nếu package chưa cài hoặc model load thất bại
     try:
-        t = get_tts(engine)
+        t = get_tts(engine, require_voice_cloning=(engine == "vieneu" and use_cloning))
     except ImportError:
         return None, (
             "❌ Package 'omnivoice' chưa được cài đặt!\n"
@@ -309,8 +348,6 @@ def synthesize(
 
     if total == 0:
         return None, "⚠️ Văn bản trống sau khi xử lý."
-
-    use_cloning = bool(ref_audio_path and ref_text and ref_text.strip())
 
     # Chuẩn bị voice preset (chỉ VieNeu-TTS)
     voice_data = None
@@ -562,6 +599,16 @@ def synthesize_srt(
     if not srt_path:
         return None, "Vui long upload file .srt."
 
+    try:
+        ref_audio_path = coerce_ref_audio_path(ref_audio_path)
+    except Exception as e:
+        return None, f"Khong the doc audio tham chieu: {e}"
+
+    use_cloning = bool(ref_audio_path and ref_text and ref_text.strip())
+
+    if ref_audio_path and not (ref_text and ref_text.strip()):
+        return None, "Can transcript cua audio tham chieu de clone giong."
+
     if engine == "omnivoice":
         if not ref_audio_path:
             return None, "OmniVoice can audio tham chieu trong tab Voice Cloning."
@@ -569,7 +616,7 @@ def synthesize_srt(
             return None, "OmniVoice can transcript cua audio tham chieu."
 
     try:
-        t = get_tts(engine)
+        t = get_tts(engine, require_voice_cloning=(engine == "vieneu" and use_cloning))
     except ImportError:
         return None, (
             "Package 'omnivoice' chua duoc cai dat.\n"
@@ -596,7 +643,6 @@ def synthesize_srt(
     if not segments:
         return None, "Khong con noi dung de doc sau khi lam sach SRT."
 
-    use_cloning = bool(ref_audio_path and ref_text and ref_text.strip())
     voice_data = None
     if engine == "vieneu" and not use_cloning and voice_id and voice_id != "__none__":
         try:

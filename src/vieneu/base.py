@@ -4,11 +4,53 @@ from typing import Optional, Union, List, Dict, Any
 import json
 import numpy as np
 import logging
+import tempfile
 from huggingface_hub import hf_hub_download
 from sea_g2p import Normalizer
 
 # Configure logging
 logger = logging.getLogger("Vieneu")
+
+
+def coerce_ref_audio_path(ref_audio: Any) -> Optional[str]:
+    """Return a filesystem path for Gradio/file-like reference audio inputs."""
+    if ref_audio is None:
+        return None
+
+    if isinstance(ref_audio, (str, Path)):
+        return str(ref_audio)
+
+    if isinstance(ref_audio, dict):
+        for key in ("path", "name", "file", "filepath"):
+            value = ref_audio.get(key)
+            if value:
+                return coerce_ref_audio_path(value)
+        return None
+
+    if hasattr(ref_audio, "name") and ref_audio.name:
+        return str(ref_audio.name)
+
+    if isinstance(ref_audio, tuple) and len(ref_audio) == 2:
+        sample_rate, audio = ref_audio
+        if not isinstance(sample_rate, (int, np.integer)):
+            audio, sample_rate = sample_rate, audio
+        audio = np.asarray(audio)
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        if audio.dtype.kind in {"i", "u"}:
+            max_value = float(np.iinfo(audio.dtype).max)
+            audio = audio.astype(np.float32) / max_value
+        else:
+            audio = audio.astype(np.float32, copy=False)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        import soundfile as sf
+        sf.write(tmp.name, audio, int(sample_rate))
+        return tmp.name
+
+    return str(ref_audio)
+
 
 class BaseVieneuTTS(ABC):
     """
@@ -199,6 +241,7 @@ class BaseVieneuTTS(ABC):
             Union[np.ndarray, torch.Tensor]: Encoded codes.
         """
         import librosa
+        ref_audio_path = coerce_ref_audio_path(ref_audio_path)
         wav, _ = librosa.load(ref_audio_path, sr=16000, mono=True)
         
         # If we have an ONNX encoder or specialized turbo encoder, handle it here
@@ -270,7 +313,7 @@ class BaseVieneuTTS(ABC):
             ref_text = voice.get('text', ref_text)
 
         if ref_audio is not None and ref_codes is None:
-            ref_codes = self.encode_reference(ref_audio)
+            ref_codes = self.encode_reference(coerce_ref_audio_path(ref_audio))
         elif self._default_voice and (ref_codes is None or ref_text is None):
             try:
                 voice_data = self.get_preset_voice(None)

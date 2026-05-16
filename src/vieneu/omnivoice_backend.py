@@ -26,6 +26,8 @@ from typing import Optional, Union
 
 import numpy as np
 
+from .base import coerce_ref_audio_path
+
 logger = logging.getLogger("OmniVoiceBackend")
 
 # Default model hosted on HuggingFace
@@ -229,11 +231,12 @@ class OmniVoiceTTS:
         -------
         voice_prompt : OmniVoice voice prompt object
         """
-        cache_key = f"{ref_audio}::{ref_text}"
+        ref_audio_path = coerce_ref_audio_path(ref_audio)
+        cache_key = f"{ref_audio_path}::{ref_text}"
         if cache_key not in self._voice_prompt_cache:
             logger.info("🎙️  Đang encode giọng tham chiếu...")
             self._voice_prompt_cache[cache_key] = self._model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
+                ref_audio=ref_audio_path,
                 ref_text=ref_text,
             )
             logger.info("✅ Encode giọng tham chiếu xong (đã cache).")
@@ -279,7 +282,8 @@ class OmniVoiceTTS:
         if self._model is None:
             raise RuntimeError("OmniVoice model chưa được load. Gọi _load_model() trước.")
 
-        if not ref_audio or not ref_text or not ref_text.strip():
+        ref_audio_path = coerce_ref_audio_path(ref_audio)
+        if not ref_audio_path or not ref_text or not ref_text.strip():
             raise ValueError(
                 "OmniVoice cần audio tham chiếu và transcript để clone giọng.\n"
                 "Vui lòng upload file WAV/MP3 (3-10 giây) và điền transcript chính xác."
@@ -296,7 +300,7 @@ class OmniVoiceTTS:
             config = None   # Dùng default config của model
 
         # Lấy voice prompt (có cache)
-        voice_prompt = self.create_voice_prompt(str(ref_audio), ref_text.strip())
+        voice_prompt = self.create_voice_prompt(ref_audio_path, ref_text.strip())
 
         # Generate
         logger.debug(f"🎙️  OmniVoice generate: {len(text)} ký tự, "

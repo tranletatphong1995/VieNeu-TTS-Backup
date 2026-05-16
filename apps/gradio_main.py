@@ -3,6 +3,7 @@ print("⏳ Đang khởi động VieNeu-TTS... Vui lòng chờ...")
 import soundfile as sf
 import tempfile
 from vieneu import Vieneu
+from vieneu.base import coerce_ref_audio_path
 import os
 import sys
 import time
@@ -695,11 +696,14 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             
         elif mode_tab == "custom_mode":
             # Reference from Custom Cloning UI
+            custom_audio = coerce_ref_audio_path(custom_audio)
             if custom_audio is None:
                  raise ValueError("Vui lòng upload file Audio mẫu (Reference Audio)!")
             if not custom_text or not custom_text.strip():
                  raise ValueError("Vui lòng nhập nội dung văn bản của Audio mẫu (Reference Text)!")
-            
+            if type(tts).__name__ == "TurboVieNeuTTS":
+                 raise ValueError("Turbo v2 khong ho tro Voice Cloning. Hay chon model VieNeu-TTS GPU/0.3B hoac OmniVoice.")
+
             ref_text_raw = custom_text.strip()
             ref_codes = tts.encode_reference(custom_audio)
             
@@ -1371,6 +1375,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         tab_custom.select(lambda: "custom_mode", outputs=current_mode_state)
         
         def validate_audio_duration(audio_path):
+            audio_path = coerce_ref_audio_path(audio_path)
             if not audio_path:
                 return gr.update(visible=False)
             try:

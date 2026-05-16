@@ -206,6 +206,12 @@ class TurboVieNeuTTS(BaseVieneuTTS):
         skip_phonemize: bool = False,
         **kwargs
     ) -> np.ndarray:
+        if kwargs.get("ref_audio") is not None:
+            raise ValueError(
+                "TurboVieNeuTTS does not support reference-audio voice cloning. "
+                "Use VieNeu standard/fast mode or OmniVoice for voice cloning."
+            )
+
         # Fix: Use full phonemization pipeline for bilingual support
         if not skip_phonemize:
             phonemes = phonemize_text(text)
@@ -272,6 +278,12 @@ class TurboVieNeuTTS(BaseVieneuTTS):
         skip_phonemize: bool = False,
         **kwargs
     ) -> Generator[np.ndarray, None, None]:
+        if kwargs.get("ref_audio") is not None:
+            raise ValueError(
+                "TurboVieNeuTTS does not support reference-audio voice cloning. "
+                "Use VieNeu standard/fast mode or OmniVoice for voice cloning."
+            )
+
         # Fix: Use full phonemization pipeline for bilingual support
         if not skip_phonemize:
             phonemes = phonemize_text(text)
