@@ -292,6 +292,7 @@ def synthesize(
     ref_audio_path,
     ref_text,
     num_step,
+    active_tab,
     progress=gr.Progress(track_tqdm=True),
 ):
     """
@@ -307,26 +308,13 @@ def synthesize(
     except Exception as e:
         return None, f"❌ Không thể đọc audio tham chiếu: {e}"
 
-    use_cloning = bool(ref_audio_path and ref_text and ref_text.strip())
+    use_cloning = (active_tab == "cloning" and bool(ref_audio_path))
 
-    if ref_audio_path and not (ref_text and ref_text.strip()):
+    if engine == "omnivoice" and not use_cloning:
         return None, (
-            "❌ Cần transcript của audio tham chiếu để clone giọng.\n"
-            "Vui lòng điền đúng nội dung nói trong file audio tham chiếu."
+            "❌ OmniVoice chỉ hỗ trợ Voice Cloning.\n"
+            "Vui lòng chuyển sang tab 'Voice Cloning' và upload file audio tham chiếu."
         )
-
-    # Validate OmniVoice requirements
-    if engine == "omnivoice":
-        if not ref_audio_path:
-            return None, (
-                "❌ OmniVoice cần audio tham chiếu!\n"
-                "Vui lòng upload file WAV/MP3 (3-10 giây) trong tab 'Voice Cloning'."
-            )
-        if not ref_text or not ref_text.strip():
-            return None, (
-                "❌ OmniVoice cần transcript của audio tham chiếu!\n"
-                "Vui lòng điền nội dung nói trong file audio vào ô 'Nội dung nói trong file tham chiếu'."
-            )
 
     # Load engine — bắt lỗi nếu package chưa cài hoặc model load thất bại
     try:
@@ -342,6 +330,22 @@ def synthesize(
 
     if t is None:
         return None, f"❌ Engine '{engine}' không khởi động được."
+
+    # Validate Voice Cloning requirements based on engine capability
+    if use_cloning:
+        t_name = type(t).__name__
+        if engine == "omnivoice":
+            if not ref_text or not ref_text.strip():
+                return None, (
+                    "❌ OmniVoice cần transcript của audio tham chiếu!\n"
+                    "Vui lòng điền nội dung nói trong file audio vào ô 'Nội dung nói trong file tham chiếu'."
+                )
+        elif t_name in ("VieNeuTTS", "FastVieNeuTTS"):
+            if not ref_text or not ref_text.strip():
+                return None, (
+                    "❌ Cần transcript của audio tham chiếu để clone giọng.\n"
+                    "Vui lòng điền đúng nội dung nói trong file audio tham chiếu."
+                )
 
     chunks = chunk_text(text.strip(), max_chars=250)
     total = len(chunks)
@@ -589,6 +593,7 @@ def synthesize_srt(
     srt_max_chars,
     srt_max_gap_ms,
     remove_bracketed,
+    active_tab,
     progress=gr.Progress(track_tqdm=True),
 ):
     """
@@ -604,16 +609,10 @@ def synthesize_srt(
     except Exception as e:
         return None, f"Khong the doc audio tham chieu: {e}"
 
-    use_cloning = bool(ref_audio_path and ref_text and ref_text.strip())
+    use_cloning = (active_tab == "cloning" and bool(ref_audio_path))
 
-    if ref_audio_path and not (ref_text and ref_text.strip()):
-        return None, "Can transcript cua audio tham chieu de clone giong."
-
-    if engine == "omnivoice":
-        if not ref_audio_path:
-            return None, "OmniVoice can audio tham chieu trong tab Voice Cloning."
-        if not ref_text or not ref_text.strip():
-            return None, "OmniVoice can transcript cua audio tham chieu."
+    if engine == "omnivoice" and not use_cloning:
+        return None, "OmniVoice can audio tham chieu trong tab Voice Cloning."
 
     try:
         t = get_tts(engine, require_voice_cloning=(engine == "vieneu" and use_cloning))
@@ -624,6 +623,18 @@ def synthesize_srt(
         )
     except Exception as e:
         return None, f"Khong the khoi dong engine {engine}: {e}"
+
+    if t is None:
+        return None, "Engine khong khoi dong duoc."
+
+    if use_cloning:
+        t_name = type(t).__name__
+        if engine == "omnivoice":
+            if not ref_text or not ref_text.strip():
+                return None, "OmniVoice can transcript cua audio tham chieu."
+        elif t_name in ("VieNeuTTS", "FastVieNeuTTS"):
+            if not ref_text or not ref_text.strip():
+                return None, "Can transcript cua audio tham chieu de clone giong."
 
     try:
         cues = read_srt(srt_path)
@@ -815,8 +826,9 @@ with gr.Blocks(
         # ── Cột phải: Cài đặt ────────────────────────────────────────────────
         with gr.Column(scale=2):
             gr.Markdown("### ⚙️ Cài đặt giọng nói")
+            active_tab_state = gr.State("preset")
 
-            with gr.Tab("🎙️ Giọng có sẵn"):
+            with gr.Tab("🎙️ Giọng có sẵn") as tab_preset:
                 # Lưu ý khi dùng OmniVoice
                 omnivoice_note = gr.Markdown(
                     "⚠️ **OmniVoice không hỗ trợ preset voices.** "
@@ -840,7 +852,7 @@ with gr.Blocks(
                     outputs=voice_dd,
                 )
 
-            with gr.Tab("🔬 Voice Cloning"):
+            with gr.Tab("🔬 Voice Cloning") as tab_cloning:
                 gr.Markdown(
                     "Upload file audio mẫu (WAV/MP3, 3–10 giây, giọng rõ, không tiếng ồn). "
                     "Khi dùng voice cloning, **tất cả các đoạn** sẽ bám sát giọng mẫu này.\n\n"
@@ -860,6 +872,9 @@ with gr.Blocks(
                     "> ⚠️ **Quan trọng:** `ref_text` phải khớp chính xác với nội dung trong "
                     "file audio. Nếu không khớp, chất lượng sẽ giảm."
                 )
+
+            tab_preset.select(lambda: "preset", outputs=active_tab_state)
+            tab_cloning.select(lambda: "cloning", outputs=active_tab_state)
 
             # OmniVoice advanced settings
             with gr.Accordion("⚡ Cài đặt OmniVoice nâng cao", open=False):
@@ -917,7 +932,7 @@ with gr.Blocks(
 
     gen_btn.click(
         fn=synthesize,
-        inputs=[text_input, engine_radio, voice_dd, ref_audio, ref_text, num_step_slider],
+        inputs=[text_input, engine_radio, voice_dd, ref_audio, ref_text, num_step_slider, active_tab_state],
         outputs=[audio_out, status_box],
     )
 
@@ -934,6 +949,7 @@ with gr.Blocks(
             srt_max_chars,
             srt_max_gap_ms,
             remove_bracketed,
+            active_tab_state,
         ],
         outputs=[audio_out, status_box],
     )
