@@ -1,34 +1,53 @@
 import pytest
-from unittest.mock import patch
+import sys
+from unittest.mock import patch, MagicMock
+
+# Mock heavy modules before importing Vieneu
+mock_torch = MagicMock()
+# Ensure torch.Tensor is available for type hinting
+mock_torch.Tensor = MagicMock
+sys.modules["torch"] = mock_torch
+sys.modules["torch.backends"] = mock_torch.backends
+sys.modules["torch.backends.mps"] = mock_torch.backends.mps
+sys.modules["llama_cpp"] = MagicMock()
+sys.modules["lmdeploy"] = MagicMock()
+sys.modules["neucodec"] = MagicMock()
+sys.modules["transformers"] = MagicMock()
+sys.modules["peft"] = MagicMock()
+
 from vieneu.factory import Vieneu
-from vieneu.standard import VieNeuTTS
-from vieneu.fast import FastVieNeuTTS
-from vieneu.remote import RemoteVieNeuTTS
 
-def test_factory_standard():
-    with patch('vieneu.standard.VieNeuTTS.__init__', return_value=None):
-        tts = Vieneu(mode='standard')
-        assert isinstance(tts, VieNeuTTS)
+@patch("vieneu.turbo.TurboVieNeuTTS", create=True)
+def test_factory_turbo(mock_turbo):
+    Vieneu(mode="turbo")
+    mock_turbo.assert_called_once()
 
-def test_factory_fast():
-    with patch('vieneu.fast.FastVieNeuTTS.__init__', return_value=None):
-        tts = Vieneu(mode='fast')
-        assert isinstance(tts, FastVieNeuTTS)
+@patch("vieneu.turbo.TurboGPUVieNeuTTS", create=True)
+def test_factory_turbo_gpu(mock_turbo_gpu):
+    Vieneu(mode="turbo_gpu")
+    mock_turbo_gpu.assert_called_once()
 
-def test_factory_remote():
-    with patch('vieneu.remote.RemoteVieNeuTTS.__init__', return_value=None):
-        tts = Vieneu(mode='remote')
-        assert isinstance(tts, RemoteVieNeuTTS)
+@patch("vieneu.fast.FastVieNeuTTS", create=True)
+def test_factory_fast(mock_fast):
+    Vieneu(mode="fast")
+    mock_fast.assert_called_once()
 
-def test_factory_xpu_error():
-    # XPU will likely fail in this environment due to lack of torch.xpu
-    with pytest.raises(RuntimeError, match="Failed to load XPU backend"):
-        Vieneu(mode='xpu')
+@patch("vieneu.standard.VieNeuTTS", create=True)
+def test_factory_standard(mock_standard):
+    Vieneu(mode="standard")
+    mock_standard.assert_called_once()
 
-def test_factory_xpu_success():
-    # Mocking torch.xpu availability is complex, but we can mock the class instantiation
-    with patch('torch.xpu.is_available', return_value=True), \
-         patch('vieneu.core_xpu.XPUVieNeuTTS.__init__', return_value=None):
-             tts = Vieneu(mode='xpu')
-             from vieneu.core_xpu import XPUVieNeuTTS
-             assert isinstance(tts, XPUVieNeuTTS)
+@patch("vieneu.remote.RemoteVieNeuTTS", create=True)
+def test_factory_remote(mock_remote):
+    Vieneu(mode="remote")
+    mock_remote.assert_called_once()
+
+@patch("vieneu.core_xpu.XPUVieNeuTTS", create=True)
+def test_factory_xpu(mock_xpu):
+    Vieneu(mode="xpu")
+    mock_xpu.assert_called_once()
+
+def test_factory_invalid_mode():
+    # Factory with unknown mode should return None (match-case without default)
+    # The current implementation of factory.py ends with the last case
+    assert Vieneu(mode="unknown") is None

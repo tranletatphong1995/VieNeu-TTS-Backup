@@ -1,12 +1,13 @@
-
-
-def Vieneu(mode="turbo", **kwargs):
+def Vieneu(mode="v3turbo", **kwargs):
     """
     Factory function for VieNeu-TTS.
 
     Args:
-        mode: 'standard' (CPU/GPU-GGUF), 'fast' (GPU-LMDeploy), 'remote' (API),
-              'xpu' (Intel GPU), 'turbo' (CPU llama.cpp),
+        mode: 'v3turbo' (DEFAULT) — VieNeu-TTS v3 Turbo, 48 kHz. CPU runs torch-free
+              via ONNX Runtime; GPU uses PyTorch. Works with the minimal install.
+              Other modes need extras (``pip install vieneu[gpu]``):
+              'standard' (CPU/GPU-GGUF), 'fast' (GPU-LMDeploy), 'turbo'/'turbo_gpu',
+              'remote' (API), 'xpu' (Intel GPU),
               'omnivoice' (OmniVoice Vietnamese — zero-shot voice cloning)
         **kwargs: Arguments for chosen class
 
@@ -21,6 +22,9 @@ def Vieneu(mode="turbo", **kwargs):
         use_compile (bool): Enable torch.compile for faster inference. Default False.
     """
     match mode:
+        case "v3turbo":
+            from .v3turbo import V3TurboVieNeuTTS
+            return V3TurboVieNeuTTS(**kwargs)
         case "remote" | "api":
             from .remote import RemoteVieNeuTTS
             return RemoteVieNeuTTS(**kwargs)
@@ -30,6 +34,9 @@ def Vieneu(mode="turbo", **kwargs):
         case "turbo":
             from .turbo import TurboVieNeuTTS
             return TurboVieNeuTTS(**kwargs)
+        case "turbo_gpu":
+            from .turbo import TurboGPUVieNeuTTS
+            return TurboGPUVieNeuTTS(**kwargs)
         case "xpu":
             try:
                 from .core_xpu import XPUVieNeuTTS
@@ -49,8 +56,3 @@ def Vieneu(mode="turbo", **kwargs):
                     "  pip install omnivoice\n"
                     f"Chi tiết lỗi: {e}"
                 ) from e
-        case _:
-            raise ValueError(
-                f"Mode '{mode}' không hợp lệ. Các mode được hỗ trợ: "
-                "'turbo', 'standard', 'fast', 'remote', 'xpu', 'omnivoice'"
-            )

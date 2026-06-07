@@ -28,7 +28,7 @@ def preprocess_sample(sample, tokenizer, max_len=2048):
     vq_codes = sample["codes"]
     
     codes_str = "".join([f"<|speech_{i}|>" for i in vq_codes])
-    chat = f"""user: Convert the text to speech:<|TEXT_PROMPT_START|>{phones}<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}<|SPEECH_GENERATION_END|>"""
+    chat = f"""<|TEXT_PROMPT_START|>{phones}<|TEXT_PROMPT_END|><|SPEECH_GENERATION_START|>{codes_str}<|SPEECH_GENERATION_END|>"""
     
     ids = tokenizer.encode(chat)
     

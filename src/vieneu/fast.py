@@ -6,10 +6,9 @@ import gc
 import logging
 from collections import defaultdict
 from .base import BaseVieneuTTS
-from .utils import _compile_codec_with_triton, extract_speech_ids, _linear_overlap_add
-from vieneu_utils.phonemize_text import phonemize_with_dict, phonemize_batch
+from .utils import _compile_codec_with_triton, extract_speech_ids, _linear_overlap_add, normalize_device
+from vieneu_utils.phonemize_text import phonemize_batch
 from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks
-from neucodec import NeuCodec, DistillNeuCodec
 
 logger = logging.getLogger("Vieneu.Fast")
 
@@ -26,13 +25,14 @@ class FastVieNeuTTS(BaseVieneuTTS):
         codec_device: str = "cuda",
         memory_util: float = 0.3,
         tp: int = 1,
-        enable_prefix_caching: bool = True,
+        enable_prefix_caching: bool = False,
         quant_policy: int = 0,
         enable_triton: bool = True,
         max_batch_size: int = 4,
         hf_token: Optional[str] = None,
     ):
         super().__init__()
+        self.device = backbone_device
 
         if backbone_device != "cuda" and not backbone_device.startswith("cuda:"):
             raise ValueError("LMDeploy backend requires CUDA device")
@@ -50,6 +50,8 @@ class FastVieNeuTTS(BaseVieneuTTS):
 
         self._is_onnx_codec = False
         self._triton_enabled = False
+
+        self.use_chat_format = backbone_repo.rstrip("/").endswith("pnnbao-ump/VieNeu-TTS")
 
         self._load_backbone_lmdeploy(backbone_repo, memory_util, tp, enable_prefix_caching, quant_policy, hf_token)
         self._load_codec(codec_repo, codec_device, enable_triton)
@@ -82,38 +84,21 @@ class FastVieNeuTTS(BaseVieneuTTS):
         self.backbone = pipeline(repo, backend_config=backend_config)
         self.gen_config = GenerationConfig(
             top_p=0.95, top_k=50, temperature=1.0, max_new_tokens=2048,
+            repetition_penalty=1.2,
             do_sample=True, min_new_tokens=40,
         )
 
-    def _load_codec(self, codec_repo, codec_device, enable_triton):
-        logger.info(f"Loading codec from: {codec_repo} on {codec_device}")
-        match codec_repo:
-            case "neuphonic/neucodec":
-                self.codec = NeuCodec.from_pretrained(codec_repo)
-                self.codec.eval().to(codec_device)
-            case "neuphonic/distill-neucodec":
-                self.codec = DistillNeuCodec.from_pretrained(codec_repo)
-                self.codec.eval().to(codec_device)
-            case "neuphonic/neucodec-onnx-decoder-int8":
-                if codec_device != "cpu":
-                    raise ValueError("ONNX decoder only runs on CPU")
-                try:
-                    from neucodec import NeuCodecOnnxDecoder
-                except ImportError as e:
-                    raise ImportError("Failed to import ONNX decoder.") from e
-                self.codec = NeuCodecOnnxDecoder.from_pretrained(codec_repo)
-                self._is_onnx_codec = True
-            case _:
-                raise ValueError(f"Unsupported codec repository: {codec_repo}")
+    def _load_codec(self, codec_repo: str, codec_device: str, enable_triton: bool) -> None:
+        super()._load_codec(codec_repo, codec_device)
 
-        if enable_triton and not self._is_onnx_codec and codec_device != "cpu":
+        if enable_triton and not getattr(self, "_is_onnx_codec", False) and codec_device != "cpu":
             self._triton_enabled = _compile_codec_with_triton(self.codec)
 
     def _warmup_model(self):
         logger.info("🔥 Warming up model...")
         try:
             dummy_codes = list(range(10))
-            dummy_prompt = self._format_prompt(dummy_codes, "warmup", "test")
+            dummy_prompt = self._format_prompt(dummy_codes, "warmup", "test", use_chat_format=self.use_chat_format)
             _ = self.backbone([dummy_prompt], gen_config=self.gen_config, do_preprocess=False)
             logger.info("   ✅ Warmup complete")
         except Exception as e:
@@ -139,7 +124,7 @@ class FastVieNeuTTS(BaseVieneuTTS):
         return recon[0, 0, :]
 
 
-    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False) -> np.ndarray:
+    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
@@ -154,17 +139,22 @@ class FastVieNeuTTS(BaseVieneuTTS):
             return np.array([], dtype=np.float32)
 
         if len(chunks) == 1:
-            prompt = self._format_prompt(ref_codes, ref_text, chunks[0])
+            prompt = self._format_prompt(ref_codes, ref_text, chunks[0], 
+                                        use_chat_format=self.use_chat_format,
+                                        emotion_tag=kwargs.get('emotion_tag'))
             responses = self.backbone([prompt], gen_config=self.gen_config, do_preprocess=False)
             wav = self._decode(responses[0].text)
-            wav = self._apply_watermark(wav)
+            if apply_watermark:
+                wav = self._apply_watermark(wav)
         else:
-            all_wavs = self.infer_batch(chunks, ref_codes, ref_text, voice=voice, temperature=temperature, top_k=top_k, skip_normalize=True)
+            all_wavs = self.infer_batch(chunks, ref_codes, ref_text, voice=voice, temperature=temperature, top_k=top_k, skip_normalize=True, apply_watermark=False, **kwargs)
             wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
+            if apply_watermark:
+                wav = self._apply_watermark(wav)
 
         return wav
 
-    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, max_batch_size: Optional[int] = None) -> List[np.ndarray]:
+    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, max_batch_size: Optional[int] = None, **kwargs) -> List[np.ndarray]:
 
         if not skip_normalize:
             texts = [self.normalizer.normalize(t) for t in texts]
@@ -184,7 +174,9 @@ class FastVieNeuTTS(BaseVieneuTTS):
         for i in range(0, len(texts), max_batch_size):
             batch_texts = texts[i : i + max_batch_size]
             batch_phonemes = chunk_phonemes[i : i + max_batch_size]
-            prompts = [self._format_prompt(ref_codes, ref_text, text, ref_phonemes=ref_phonemes, input_phonemes=ph)
+            prompts = [self._format_prompt(ref_codes, ref_text, text, ref_phonemes=ref_phonemes, 
+                                          input_phonemes=ph, use_chat_format=self.use_chat_format,
+                                          emotion_tag=kwargs.get('emotion_tag'))
                       for text, ph in zip(batch_texts, batch_phonemes)]
             responses = self.backbone(prompts, gen_config=self.gen_config, do_preprocess=False)
             batch_codes = [response.text for response in responses]
@@ -194,7 +186,7 @@ class FastVieNeuTTS(BaseVieneuTTS):
             all_wavs.extend(batch_wavs)
         return all_wavs
 
-    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False) -> Generator[np.ndarray, None, None]:
+    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, **kwargs) -> Generator[np.ndarray, None, None]:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
@@ -206,15 +198,11 @@ class FastVieNeuTTS(BaseVieneuTTS):
 
         chunks = split_text_into_chunks(text, max_chars=max_chars)
         for chunk in chunks:
-            yield from self._infer_stream_single(chunk, ref_codes, ref_text)
+            yield from self._infer_stream_single(chunk, ref_codes, ref_text, emotion_tag=kwargs.get('emotion_tag'))
 
-    def _infer_stream_single(self, text: str, ref_codes: Union[np.ndarray, torch.Tensor, List[int]], ref_text: str) -> Generator[np.ndarray, None, None]:
-        if isinstance(ref_codes, (torch.Tensor, np.ndarray)):
-            ref_codes_list = ref_codes.flatten().tolist()
-        else:
-            ref_codes_list = ref_codes
-
-        prompt = self._format_prompt(ref_codes_list, ref_text, text)
+    def _infer_stream_single(self, text: str, ref_codes: Any, ref_text: str, emotion_tag: Optional[str] = None) -> Generator[np.ndarray, None, None]:
+        ref_codes_list = self.to_list(ref_codes)
+        prompt = self._format_prompt(ref_codes_list, ref_text, text, use_chat_format=self.use_chat_format, emotion_tag=emotion_tag)
         audio_cache = []
         token_cache = [f"<|speech_{idx}|>" for idx in ref_codes_list]
         n_decoded_samples = 0
@@ -268,5 +256,5 @@ class FastVieNeuTTS(BaseVieneuTTS):
             'max_batch_size': self.max_batch_size,
             'cached_references': len(self._ref_cache),
             'active_sessions': len(self.stored_dict),
-            'prefix_caching': True,
+            'prefix_caching': False,
         }

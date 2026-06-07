@@ -58,10 +58,17 @@ class BaseVieneuTTS(ABC):
     Provides shared functionality for voice management and common operations.
     """
 
-    def __init__(self):
+    def __init__(self, codec_repo: Optional[str] = None, codec_device: str = "cpu"):
         self.sample_rate = 24_000
         self.max_context = 2048
         self.hop_length = 480
+
+        # Default streaming parameters
+        self.streaming_overlap_frames = 1
+        self.streaming_frames_per_chunk = 50
+        self.streaming_lookforward = 5
+        self.streaming_lookback = 50
+        self.streaming_stride_samples = self.streaming_frames_per_chunk * self.hop_length
 
         self.assets_dir = Path(__file__).parent / "assets"
         self._preset_voices: Dict[str, Any] = {}
@@ -72,6 +79,60 @@ class BaseVieneuTTS(ABC):
         # Watermarker placeholder
         self.watermarker = None
         self._init_watermarker()
+
+        if codec_repo:
+            self._load_codec(codec_repo, codec_device)
+
+    def _load_codec(self, codec_repo: str, codec_device: str) -> None:
+        """Universal codec loader for all backends."""
+        logger.info(f"📦 Loading codec from: {codec_repo} on {codec_device} ...")
+
+        if any(x in codec_repo.lower() for x in ["onnx", "vieneu-codec"]) or codec_repo == "neuphonic/neucodec-onnx-decoder-int8":
+            if codec_device != "cpu":
+                logger.warning("⚠️ ONNX decoder only runs on CPU. Ignoring device selection.")
+            try:
+                from .utils import NeuCodecOnnx
+                self.codec = NeuCodecOnnx.from_pretrained(codec_repo)
+                self._is_onnx_codec = True
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load standalone ONNX decoder: {e}. Trying via neucodec package...")
+                try:
+                    from neucodec import NeuCodecOnnxDecoder
+                    self.codec = NeuCodecOnnxDecoder.from_pretrained(codec_repo)
+                    self._is_onnx_codec = True
+                    return
+                except ImportError:
+                    raise ImportError(
+                        "The 'onnxruntime' package is required for ONNX decoder. \n"
+                        "Please install it via: pip install onnxruntime"
+                    ) from e
+
+        # For PyTorch codecs, check for torch first
+        try:
+            import torch
+            from neucodec import NeuCodec, DistillNeuCodec
+            
+            # Check MPS
+            if codec_device == "mps" and not torch.backends.mps.is_available():
+                logger.warning("⚠️ MPS not available for codec, falling back to CPU")
+                codec_device = "cpu"
+
+            if codec_repo == "neuphonic/neucodec":
+                self.codec = NeuCodec.from_pretrained(codec_repo)
+            elif codec_repo == "neuphonic/distill-neucodec":
+                self.codec = DistillNeuCodec.from_pretrained(codec_repo)
+            else:
+                raise ValueError(f"Unrecognized codec repository: {codec_repo}")
+
+            self.codec.eval().to(codec_device)
+        except ImportError:
+            raise ImportError(
+                f"Codec '{codec_repo}' requires PyTorch. \n"
+                "To remain lightweight in Remote mode, please use 'neuphonic/neucodec-onnx-decoder-int8'. \n"
+                "Or install torch via: pip install vieneu[gpu]"
+            )
+
 
     def _init_watermarker(self) -> None:
         """Initialize optional audio watermarker."""
@@ -208,11 +269,15 @@ class BaseVieneuTTS(ABC):
         
         # Only convert to torch if explicitly requested or if we're not in turbo mode
         if isinstance(codes, list):
-            try:
-                import torch
-                codes = torch.tensor(codes, dtype=torch.long)
-            except ImportError:
-                codes = np.array(codes, dtype=np.int64)
+            if codes and isinstance(codes[0], float):
+                codes = np.array(codes, dtype=np.float32)
+            else:
+                # Là integer token sequence (Standard mode)
+                try:
+                    import torch
+                    codes = torch.tensor(codes, dtype=torch.long)
+                except ImportError:
+                    codes = np.array(codes, dtype=np.int64)
 
         return {"codes": codes, "text": voice_data["text"]}
 
@@ -333,31 +398,48 @@ class BaseVieneuTTS(ABC):
             return self.watermarker.apply_watermark(wav, sample_rate=self.sample_rate)
         return wav
 
+    def to_list(self, codes: Any) -> List[int]:
+        """Convert reference codes (Tensor, Array, List) to a Python list of integers."""
+        if isinstance(codes, list):
+            return codes
+        if isinstance(codes, np.ndarray):
+            return codes.flatten().tolist()
+
+        # Check for torch without importing it at module level
+        try:
+            import torch
+            if isinstance(codes, torch.Tensor):
+                return codes.flatten().tolist()
+        except ImportError:
+            pass
+
+        # Fallback for other array-like types
+        if hasattr(codes, "tolist"):
+            return codes.flatten().tolist() if hasattr(codes, "flatten") else codes.tolist()
+
+        return list(codes)
+
     def _format_prompt(
         self,
-        ref_codes: Union[List[int], 'torch.Tensor', np.ndarray],
+        ref_codes: Any,
         ref_text: str,
         input_text: str,
         ref_phonemes: Optional[str] = None,
-        input_phonemes: Optional[str] = None
+        input_phonemes: Optional[str] = None,
+        use_chat_format: bool = False,
+        emotion_tag: Optional[str] = None
     ) -> str:
         """
         Format the prompt for the TTS model.
         Common implementation for LMDeploy (Fast) and Remote backends.
         Standard backend uses a specialized chat template via tokenizer.
+
+        Args:
+            use_chat_format: If True, wraps the prompt with chat-style user/assistant
+                             tokens (used by VieNeu-TTS GPU model). If False (default),
+                             returns a compact prompt without those wrappers.
         """
-        if isinstance(ref_codes, (np.ndarray, list)):
-            ref_codes_list = np.array(ref_codes).flatten().tolist()
-        else:
-            # Assume it's a torch tensor if torch is installed
-            try:
-                import torch
-                if isinstance(ref_codes, torch.Tensor):
-                    ref_codes_list = ref_codes.flatten().tolist()
-                else:
-                    ref_codes_list = ref_codes
-            except ImportError:
-                ref_codes_list = ref_codes
+        ref_codes_list = self.to_list(ref_codes)
 
         # Import inside method to avoid potential circular dependencies between
         # base TTS and phonemization utilities.
@@ -367,13 +449,20 @@ class BaseVieneuTTS(ABC):
         input_text_phones = input_phonemes if input_phonemes else phonemize_with_dict(input_text, skip_normalize=True)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
 
+        emotion_prefix = emotion_tag if emotion_tag else ""
+
+        if use_chat_format:
+            return (
+                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{emotion_prefix}{ref_text_phones} {input_text_phones}"
+                f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
+            )
         return (
-            f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text_phones} {input_text_phones}"
-            f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
+            f"<|TEXT_PROMPT_START|>{emotion_prefix}{ref_text_phones} {input_text_phones}"
+            f"<|TEXT_PROMPT_END|><|SPEECH_GENERATION_START|>{codes_str}"
         )
 
     @abstractmethod
-    def infer(self, text: str, **kwargs: Any) -> np.ndarray:
+    def infer(self, text: str, apply_watermark: bool = True, **kwargs: Any) -> np.ndarray:
         """Main inference method for single text."""
         pass
 

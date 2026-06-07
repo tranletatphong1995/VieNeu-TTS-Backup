@@ -3,14 +3,12 @@ import platform
 from pathlib import Path
 from typing import Optional, Union, List, Generator, Any, Dict
 import numpy as np
-import torch
 import gc
 import logging
 from .base import BaseVieneuTTS
-from .utils import extract_speech_ids, _linear_overlap_add
+from .utils import extract_speech_ids, _linear_overlap_add, normalize_device
 from vieneu_utils.phonemize_text import phonemize_with_dict, phonemize_batch
 from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks
-from neucodec import NeuCodec, DistillNeuCodec
 
 logger = logging.getLogger("Vieneu.Standard")
 
@@ -22,11 +20,13 @@ class VieNeuTTS(BaseVieneuTTS):
 
     def __init__(
         self,
-        backbone_repo: str = "pnnbao-ump/VieNeu-TTS-0.3B-q4-gguf",
+        backbone_repo: str = "pnnbao-ump/VieNeu-TTS-v2",
         backbone_device: str = "cpu",
-        codec_repo: str = "neuphonic/distill-neucodec",
+        codec_repo: str = "neuphonic/neucodec-onnx-decoder-int8",
         codec_device: str = "cpu",
         hf_token: Optional[str] = None,
+        gguf_filename: Optional[str] = "VieNeu-TTS-v2-Q4-K-M.gguf",
+        emotion: str = "natural",
     ):
         super().__init__()
 
@@ -43,8 +43,14 @@ class VieNeuTTS(BaseVieneuTTS):
         self.backbone = None
         self.codec = None
 
+        # Only pnnbao-ump/VieNeu-TTS uses the full chat-format prompt
+        self.use_chat_format = backbone_repo.rstrip("/").endswith("pnnbao-ump/VieNeu-TTS")
+        
+        # Set default emotion tag
+        self.default_emotion = "<|emotion_0|>" if emotion == "natural" else None
+
         if backbone_repo:
-            self._load_backbone(backbone_repo, backbone_device, hf_token)
+            self._load_backbone(backbone_repo, backbone_device, hf_token, gguf_filename)
         self._load_codec(codec_repo, codec_device)
         self._load_voices(backbone_repo, hf_token)
         self._warmup_model()
@@ -55,7 +61,8 @@ class VieNeuTTS(BaseVieneuTTS):
             logger.info("🔥 Warming up standard model...")
             dummy_text = "Xin chào"
             # Using very short dummy ref to speed up
-            dummy_ref_codes = torch.zeros(10, dtype=torch.long)
+            import numpy as _np
+            dummy_ref_codes = _np.zeros(10, dtype=_np.int64)
             dummy_ref_text = "Chào"
             _ = self.infer(dummy_text, ref_codes=dummy_ref_codes, ref_text=dummy_ref_text, max_chars=16)
             logger.info("   ✅ Warmup complete")
@@ -76,19 +83,21 @@ class VieNeuTTS(BaseVieneuTTS):
                 self.codec = None
 
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except ImportError:
+                pass
         except Exception as e:
             logger.error(f"Error during VieNeuTTS closure: {e}")
 
-    def _load_backbone(self, backbone_repo: str, backbone_device: str, hf_token: Optional[str] = None) -> None:
-        if backbone_device == "mps" and not torch.backends.mps.is_available():
-            logger.warning("MPS not available, falling back to CPU")
-            backbone_device = "cpu"
-
+    def _load_backbone(self, backbone_repo: str, backbone_device: str, hf_token: Optional[str] = None, gguf_filename: Optional[str] = None) -> None:
+        backbone_device = normalize_device(backbone_device)
         logger.info(f"Loading backbone from: {backbone_repo} on {backbone_device} ...")
 
-        if backbone_repo.lower().endswith("gguf") or "gguf" in backbone_repo.lower():
+        is_gguf = gguf_filename or backbone_repo.lower().endswith("gguf") or "gguf" in backbone_repo.lower()
+        if is_gguf:
             try:
                 from llama_cpp import Llama
             except ImportError as e:
@@ -97,9 +106,10 @@ class VieNeuTTS(BaseVieneuTTS):
                 ) from e
             self.backbone = Llama.from_pretrained(
                 repo_id=backbone_repo,
-                filename="*.gguf",
+                filename=gguf_filename or "*.gguf",
                 verbose=False,
-                n_gpu_layers=-1 if backbone_device in ("gpu", "cuda") else 0,
+                n_gpu_layers=-1,
+                repetitive_penalty=1.2,
                 n_ctx=self.max_context,
                 mlock=True,
                 flash_attn=True if backbone_device in ("gpu", "cuda") else False,
@@ -108,16 +118,19 @@ class VieNeuTTS(BaseVieneuTTS):
             self._is_quantized_model = True
         else:
             from transformers import AutoTokenizer, AutoModelForCausalLM
-            self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo, token=hf_token)
+            self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo, token=hf_token, trust_remote_code=True)
 
             # Configure tokenizer for batching
             self.tokenizer.padding_side = "left"
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            self.backbone = AutoModelForCausalLM.from_pretrained(backbone_repo, token=hf_token).to(
-                torch.device(backbone_device)
-            )
+            import torch
+            self.backbone = AutoModelForCausalLM.from_pretrained(
+                backbone_repo, 
+                token=hf_token, 
+                trust_remote_code=True
+            ).to(torch.device(backbone_device))
 
             # Optional torch.compile for non-Windows/non-Mac platforms if desired
             if os.getenv("VIENEU_COMPILE") == "1" and platform.system() == "Linux":
@@ -128,32 +141,7 @@ class VieNeuTTS(BaseVieneuTTS):
                     logger.warning(f"Failed to compile backbone: {e}")
 
     def _load_codec(self, codec_repo: str, codec_device: str) -> None:
-        if codec_device == "mps" and not torch.backends.mps.is_available():
-            logger.warning("Warning: MPS not available for codec, falling back to CPU")
-            codec_device = "cpu"
-
-        logger.info(f"Loading codec from: {codec_repo} on {codec_device} ...")
-
-        if codec_repo == "neuphonic/neucodec":
-            self.codec = NeuCodec.from_pretrained(codec_repo)
-        elif codec_repo == "neuphonic/distill-neucodec":
-            self.codec = DistillNeuCodec.from_pretrained(codec_repo)
-        elif codec_repo == "neuphonic/neucodec-onnx-decoder-int8":
-            if codec_device != "cpu":
-                raise ValueError("Onnx decoder only currently runs on CPU.")
-            try:
-                from neucodec import NeuCodecOnnxDecoder
-            except ImportError as e:
-                raise ImportError(
-                    "Failed to import the onnx decoder. Ensure onnxruntime and neucodec >= 0.0.4 are installed."
-                ) from e
-            self.codec = NeuCodecOnnxDecoder.from_pretrained(codec_repo)
-            self._is_onnx_codec = True
-        else:
-            raise ValueError(f"Unsupported codec repository: {codec_repo}")
-
-        if not self._is_onnx_codec:
-            self.codec.eval().to(codec_device)
+        super()._load_codec(codec_repo, codec_device)
 
     def load_lora_adapter(self, lora_repo_id: str, hf_token: Optional[str] = None) -> bool:
         if self._is_quantized_model:
@@ -193,15 +181,19 @@ class VieNeuTTS(BaseVieneuTTS):
             self._lora_loaded = False
             self._current_lora_repo = None
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except ImportError:
+                pass
             logger.info("   ✅ LoRA adapter unloaded, original weights restored")
             return True
         except Exception as e:
             logger.error(f"   ⚠️ Error during unload: {e}")
             return False
 
-    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False) -> np.ndarray:
+    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
@@ -216,12 +208,14 @@ class VieNeuTTS(BaseVieneuTTS):
             ref_phonemes = self.get_ref_phonemes(ref_text)
             phonemes = phonemize_with_dict(chunks[0], skip_normalize=True)
             if self._is_quantized_model:
-                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k)
+                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
             else:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes)
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 output_str = self._infer_torch(prompt_ids, temperature, top_k)
             wav = self._decode(output_str)
-            return self._apply_watermark(wav)
+            if apply_watermark:
+                wav = self._apply_watermark(wav)
+            return wav
 
         all_wavs = self.infer_batch(
             chunks,
@@ -230,12 +224,15 @@ class VieNeuTTS(BaseVieneuTTS):
             temperature=temperature,
             top_k=top_k,
             skip_normalize=True,
-            apply_watermark=False
+            apply_watermark=False,
+            **kwargs
         )
         final_wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
-        return self._apply_watermark(final_wav)
+        if apply_watermark:
+            final_wav = self._apply_watermark(final_wav)
+        return final_wav
 
-    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True) -> List[np.ndarray]:
+    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> List[np.ndarray]:
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
         if not skip_normalize:
@@ -248,16 +245,17 @@ class VieNeuTTS(BaseVieneuTTS):
         # If model is GGUF, we still process sequentially for now as llama-cpp-python batching for TTS is complex
         if self._is_quantized_model:
             for phonemes in chunk_phonemes:
-                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k)
+                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 wav = self._decode(output_str)
                 if apply_watermark:
                     wav = self._apply_watermark(wav)
                 all_wavs.append(wav)
         # If model is Torch, we can leverage true batch generation
         else:
+            import torch
             batch_prompt_ids = []
             for phonemes in chunk_phonemes:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes)
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 batch_prompt_ids.append(torch.tensor(prompt_ids))
 
             inputs = self.tokenizer.pad(
@@ -292,7 +290,7 @@ class VieNeuTTS(BaseVieneuTTS):
 
         return all_wavs
 
-    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False) -> Generator[np.ndarray, None, None]:
+    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, **kwargs) -> Generator[np.ndarray, None, None]:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
@@ -309,41 +307,45 @@ class VieNeuTTS(BaseVieneuTTS):
 
         for phonemes in chunk_phonemes:
             if self._is_quantized_model:
-                yield from self._infer_stream_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k)
+                yield from self._infer_stream_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
             else:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes)
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 output_str = self._infer_torch(prompt_ids, temperature, top_k)
                 wav = self._decode(output_str)
                 yield self._apply_watermark(wav)
 
-    def _apply_chat_template(self, ref_codes: Union[List[int], torch.Tensor, np.ndarray], ref_phonemes: str, chunk_phonemes: str) -> List[int]:
-        if isinstance(ref_codes, (torch.Tensor, np.ndarray)):
-            ref_codes_list = ref_codes.flatten().tolist()
-        else:
-            ref_codes_list = ref_codes
-
+    def _apply_chat_template(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, emotion_tag: Optional[str] = None) -> List[int]:
+        ref_codes_list = self.to_list(ref_codes)
         full_phonemes = f"{ref_phonemes} {chunk_phonemes}"
 
-        speech_replace = self.tokenizer.convert_tokens_to_ids("<|SPEECH_REPLACE|>")
         speech_gen_start = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")
-        text_replace = self.tokenizer.convert_tokens_to_ids("<|TEXT_REPLACE|>")
         text_prompt_start = self.tokenizer.convert_tokens_to_ids("<|TEXT_PROMPT_START|>")
         text_prompt_end = self.tokenizer.convert_tokens_to_ids("<|TEXT_PROMPT_END|>")
 
         input_ids = self.tokenizer.encode(full_phonemes, add_special_tokens=False)
-        chat = "user: Convert the text to speech:<|TEXT_REPLACE|>\nassistant:<|SPEECH_REPLACE|>"
-        ids = self.tokenizer.encode(chat)
-
-        text_replace_idx = ids.index(text_replace)
-        ids = ids[:text_replace_idx] + [text_prompt_start] + input_ids + [text_prompt_end] + ids[text_replace_idx + 1:]
-
-        speech_replace_idx = ids.index(speech_replace)
         codes_str = "".join([f"<|speech_{i}|>" for i in ref_codes_list])
         codes = self.tokenizer.encode(codes_str, add_special_tokens=False)
-        ids = ids[:speech_replace_idx] + [speech_gen_start] + list(codes)
+
+        if self.use_chat_format:
+            speech_replace = self.tokenizer.convert_tokens_to_ids("<|SPEECH_REPLACE|>")
+            text_replace = self.tokenizer.convert_tokens_to_ids("<|TEXT_REPLACE|>")
+
+            chat = "user: Convert the text to speech:<|TEXT_REPLACE|>\nassistant:<|SPEECH_REPLACE|>"
+            ids = self.tokenizer.encode(chat)
+
+            text_replace_idx = ids.index(text_replace)
+            ids = ids[:text_replace_idx] + [text_prompt_start] + input_ids + [text_prompt_end] + ids[text_replace_idx + 1:]
+
+            speech_replace_idx = ids.index(speech_replace)
+            ids = ids[:speech_replace_idx] + [speech_gen_start] + list(codes)
+        else:
+            emotion_prefix_ids = self.tokenizer.encode(emotion_tag, add_special_tokens=False) if emotion_tag else []
+            ids = [text_prompt_start] + emotion_prefix_ids + input_ids + [text_prompt_end, speech_gen_start] + list(codes)
+
         return ids
 
     def _infer_torch(self, prompt_ids: List[int], temperature: float = 1.0, top_k: int = 50) -> str:
+        import torch
         prompt_tensor = torch.tensor(prompt_ids).unsqueeze(0).to(self.backbone.device)
         speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
         with torch.no_grad():
@@ -361,32 +363,37 @@ class VieNeuTTS(BaseVieneuTTS):
         output_str = self.tokenizer.decode(output_tokens[0, input_length:].cpu().numpy().tolist(), add_special_tokens=False)
         return output_str
 
-    def _infer_ggml(self, ref_codes: Union[List[int], torch.Tensor, np.ndarray], ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50) -> str:
-        if isinstance(ref_codes, (torch.Tensor, np.ndarray)):
-            ref_codes_list = ref_codes.flatten().tolist()
-        else:
-            ref_codes_list = ref_codes
-
+    def _infer_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50, emotion_tag: Optional[str] = None) -> str:
+        ref_codes_list = self.to_list(ref_codes)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
-        prompt = (
-            f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_phonemes} {chunk_phonemes}"
-            f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
-        )
+        emotion_prefix = emotion_tag if emotion_tag else ""
+        if self.use_chat_format:
+            prompt = (
+                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
+                f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
+            )
+        else:
+            prompt = (
+                f"<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
+                f"<|TEXT_PROMPT_END|><|SPEECH_GENERATION_START|>{codes_str}"
+            )
         output = self.backbone(prompt, max_tokens=self.max_context, temperature=temperature, top_k=top_k, stop=["<|SPEECH_GENERATION_END|>"])
         return output["choices"][0]["text"]
 
-    def _infer_stream_ggml(self, ref_codes: Union[np.ndarray, torch.Tensor, List[int]], ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50) -> Generator[np.ndarray, None, None]:
-
-        if isinstance(ref_codes, (torch.Tensor, np.ndarray)):
-            ref_codes_list = ref_codes.flatten().tolist()
-        else:
-            ref_codes_list = ref_codes
-
+    def _infer_stream_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50, emotion_tag: Optional[str] = None) -> Generator[np.ndarray, None, None]:
+        ref_codes_list = self.to_list(ref_codes)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
-        prompt = (
-            f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_phonemes} {chunk_phonemes}"
-            f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
-        )
+        emotion_prefix = emotion_tag if emotion_tag else ""
+        if self.use_chat_format:
+            prompt = (
+                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
+                f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
+            )
+        else:
+            prompt = (
+                f"<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
+                f"<|TEXT_PROMPT_END|><|SPEECH_GENERATION_START|>{codes_str}"
+            )
 
         audio_cache: List[np.ndarray] = []
         token_cache: List[str] = [f"<|speech_{idx}|>" for idx in ref_codes_list]

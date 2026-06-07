@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from vieneu.utils import _linear_overlap_add
+from vieneu.utils import _linear_overlap_add, extract_speech_ids
 from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks
 
 # --- Text Utils Tests ---
@@ -73,3 +73,9 @@ def test_join_audio_chunks_empty():
 def test_join_audio_chunks_single():
     chunk = np.ones(100)
     assert np.array_equal(join_audio_chunks([chunk], 16000), chunk)
+
+def test_extract_speech_ids():
+    codes_str = "<|speech_100|><|speech_101|><|speech_102|>"
+    assert extract_speech_ids(codes_str) == [100, 101, 102]
+    assert extract_speech_ids("no speech here") == []
+    assert extract_speech_ids("<|speech_abc|>") == []
