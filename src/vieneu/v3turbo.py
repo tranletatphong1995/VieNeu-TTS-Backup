@@ -69,6 +69,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                 moss_tokenizer_path=moss_tokenizer,
                 device=device,
                 dtype=dtype,
+                hf_token=hf_token,
             )
             self.backend = "pytorch"
         logger.info(f"✅ VieNeu-TTS v3 Turbo ready (backend={self.backend})")
